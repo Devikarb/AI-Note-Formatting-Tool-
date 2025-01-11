@@ -1,0 +1,265 @@
+"""
+Enhanced Note-Making Tool for SOC Analysis
+
+This script automates the creation of investigation notes by fetching file metadata,
+analyzing IOCs with OSINT tools, and summarizing the findings using AI.
+"""
+
+import os
+import re
+import requests
+import urllib3
+
+# Suppress InsecureRequestWarning for ignoring SSL verification
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Constants (API keys should be added to environment variables or configured securely)
+VIRUSTOTAL_API = os.getenv("VIRUSTOTAL_API_KEY")
+XFORCE_API = os.getenv("XFORCE_API_KEY")
+XFORCE_SECRET = os.getenv("XFORCE_API_SECRET")
+AI_API = os.getenv("AI_API_KEY")
+ALIENVAULT_API = os.getenv("ALIENVAULT_API_KEY")
+
+
+def parse_metadata_from_text(data):
+    """
+    Parses metadata from a raw text blob using regular expressions.
+
+    Args:
+        data (str): Raw text data containing file details.
+
+    Returns:
+        dict: Extracted metadata.
+    """
+    patterns = {
+        'file_name': r'Name:\s*(.+)',
+        'path': r'Path:\s*([^\n]+)',
+        'detection': r'Detection type:\s*(.+)',
+        'initiated_by': r'Initiated By:\s*(.+)',
+        'engine': r'Engine:\s*(.+)',
+        'classification': r'Classification:\s*(.+)',
+        'sha1': r'SHA1:\s*([a-fA-F0-9]+)',
+        'originating_process': r'Originating Process:\s*(.+)',
+        'computer_name': r'Computer Name:\s*(.+)',
+        'os_version': r'OS Version:\s*(.+)',
+        'logged_in_user': r'Logged In User:\s*(.+)',
+        'ip_address': r'IP v4 Address:\s*([\d\.,]+)',
+        'full_disk_scan': r'Full Disk Scan:\s*([^\n]+)',
+        'signature_verification': r'Signature Verification:\s*(.+)'
+    }
+
+    extracted_data = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, data)
+        extracted_data[key] = match.group(1) if match else "N/A"
+
+    return extracted_data
+
+
+def get_file_description_from_gemini(file_name, vt_score, ibm_data, av_data, api_key):
+    """
+    Generates a comprehensive analysis for the file using Gemini AI.
+
+    Args:
+        file_name (str): The name of the file.
+        vt_score (str): VirusTotal analysis score.
+        ibm_data (str): IBM X-Force analysis data.
+        av_data (str): AlienVault analysis data.
+        api_key (str): Gemini API key.
+
+    Returns:
+        str: AI-generated description.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    headers = {'Content-Type': 'application/json'}
+    osint_results = f"""
+    OSINT Analysis:
+    - VirusTotal: {vt_score}
+    - IBM X-Force: {ibm_data}
+    - AlienVault: {av_data}
+    """
+    prompt = f"""
+    Provide a comprehensive analysis for the file '{file_name}', considering the following OSINT results:
+    {osint_results}
+    Include its typical use, potential security risks, and actions an analyst should take based on these details.
+    """
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "topP": 0.9,
+            "topK": 50,
+            "maxOutputTokens": 2048
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        try:
+            description = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return description.strip()
+        except (KeyError, IndexError) as e:
+            return f"Error parsing Gemini response: {str(e)}"
+    else:
+        return f"Gemini API error {response.status_code}: {response.text}"
+
+
+def get_virustotal_score(file_hash, api_key):
+    """
+    Retrieves the VirusTotal analysis score for a given file hash.
+
+    Args:
+        file_hash (str): File SHA1 hash.
+        api_key (str): VirusTotal API key.
+
+    Returns:
+        str: VirusTotal analysis result.
+    """
+    url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
+    headers = {'x-apikey': api_key}
+
+    response = requests.get(url, headers=headers, verify=False)
+    if response.status_code == 200:
+        data = response.json()
+        analysis_stats = data['data']['attributes'].get('last_analysis_stats', {})
+        malicious = analysis_stats.get('malicious', 0)
+        total = sum(analysis_stats.values())
+        return f"{malicious}/{total} detections"
+    else:
+        return f"VirusTotal error {response.status_code}: {response.text}"
+
+
+def get_ibm_xforce_data(file_hash, api_key, api_secret):
+    """
+    Retrieves IBM X-Force analysis for a given file hash.
+
+    Args:
+        file_hash (str): File SHA1 hash.
+        api_key (str): IBM X-Force API key.
+        api_secret (str): IBM X-Force API secret.
+
+    Returns:
+        str: IBM X-Force analysis result.
+    """
+    url = f"https://api.xforce.ibmcloud.com/malware/{file_hash}"
+    response = requests.get(url, auth=(api_key, api_secret), verify=False)
+
+    if response.status_code == 200:
+        data = response.json()
+        malware_info = data.get('malware', {})
+        risk = malware_info.get('risk', 'N/A')
+        family = malware_info.get('family', 'N/A')
+        return f"Risk: {risk}, Family: {family}"
+    else:
+        return f"IBM X-Force error {response.status_code}: {response.text}"
+
+
+def get_alienvault_data(file_hash, api_key):
+    """
+    Retrieves AlienVault analysis for a given file hash.
+
+    Args:
+        file_hash (str): File SHA1 hash.
+        api_key (str): AlienVault API key.
+
+    Returns:
+        str: AlienVault analysis result.
+    """
+    url = f"https://otx.alienvault.com/api/v1/indicators/file/{file_hash}"
+    headers = {'X-OTX-API-KEY': api_key}
+
+    response = requests.get(url, headers=headers, verify=False)
+    if response.status_code == 200:
+        data = response.json()
+        pulses = data.get('pulse_info', {}).get('count', 0)
+        return f"Found in {pulses} pulses"
+    else:
+        return f"AlienVault error {response.status_code}: {response.text}"
+
+
+def extract_and_format_data(data, vt_api_key, av_api_key, ibm_api_key, ibm_api_secret, ai_api_key):
+    """
+    Extracts metadata, performs OSINT analysis, and generates investigation notes.
+
+    Args:
+        data (str): Raw text data containing file details.
+        vt_api_key (str): VirusTotal API key.
+        av_api_key (str): AlienVault API key.
+        ibm_api_key (str): IBM X-Force API key.
+        ibm_api_secret (str): IBM X-Force API secret.
+        ai_api_key (str): Gemini API key.
+
+    Returns:
+        str: Formatted investigation note.
+    """
+    metadata = parse_metadata_from_text(data)
+    
+    vt_score = get_virustotal_score(metadata['sha1'], vt_api_key) if metadata['sha1'] != "N/A" else "SHA1 not available"
+    ibm_data = get_ibm_xforce_data(metadata['sha1'], ibm_api_key, ibm_api_secret) if metadata['sha1'] != "N/A" else "SHA1 not available"
+    av_data = get_alienvault_data(metadata['sha1'], av_api_key) if metadata['sha1'] != "N/A" else "SHA1 not available"
+
+    gemini_description = get_file_description_from_gemini(
+        metadata['file_name'], vt_score, ibm_data, av_data, ai_api_key
+    ) if metadata['file_name'] != "N/A" else "File name not available"
+
+    return f"""
+    ### Investigation Note
+
+    #### Extracted Metadata:
+    - File Name: {metadata['file_name']}
+    - File Path: {metadata['path']}
+    - Detection Type: {metadata['detection']}
+    - Initiated By: {metadata['initiated_by']}
+    - Engine: {metadata['engine']}
+    - Classification: {metadata['classification']}
+    - SHA1 Hash: {metadata['sha1']}
+    - Originating Process: {metadata['originating_process']}
+    - Computer Name: {metadata['computer_name']}
+    - OS Version: {metadata['os_version']}
+    - Logged In User: {metadata['logged_in_user']}
+    - IP Address: {metadata['ip_address']}
+    - Full Disk Scan: {metadata['full_disk_scan']}
+    - Signature Verification: {metadata['signature_verification']}
+
+    #### OSINT Analysis:
+    - VirusTotal: {vt_score}
+    - IBM X-Force: {ibm_data}
+    - AlienVault: {av_data}
+
+    #### AI Analysis:
+    {gemini_description}
+
+    #### Suggested Actions:
+    - Quarantine the file if it is suspicious.
+    - Investigate the origin and usage.
+    - Follow organizational response protocols.
+    """
+
+
+def main():
+    """
+    Main function to execute the SOC analysis and generate investigation notes.
+    """
+    raw_data = """
+    Name:   report2023_update.docxPath:  C:\Temp\Downloads\report2023_update.docx   Detection type: MaliciousInitiated By: User   action
+    Engine:  Custom   Engine
+Classification:    Malware
+      SHA1: a1b2c3d4e5f67890abcdef1234567890abcdef12
+Originating Process: word.exe
+  Computer Name:    User-PC
+OS Version:   Windows 10
+Logged In User:   JohnDoe
+IP v4 Address:192.168.0.1 Full Disk Scan: Completed  Signature Verification: Valid
+    Additional Info: Not required
+This is extra junk data that should be ignored completely by the parser.
+
+    note = extract_and_format_data(
+        raw_data,
+        VIRUSTOTAL_API, ALIENVAULT_API, XFORCE_API, XFORCE_SECRET, AI_API
+    )
+
+    print(note)
+
+
+if __name__ == "__main__":
+    main()
